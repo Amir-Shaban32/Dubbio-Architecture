@@ -7,10 +7,10 @@ OpenAPI is generated from the NestJS decorators and served at `/v1/docs` outside
 
 | Module | Method | Path | Auth |
 |---|---|---|---|
-| Auth | POST | `/auth/otp/request` | public |
-| Auth | POST | `/auth/otp/verify` | public |
-| Auth | POST | `/auth/refresh` | refresh cookie |
-| Auth | POST | `/auth/logout` | user |
+| Auth (better-auth) | POST | `/auth/email-otp/send-verification-otp` | public |
+| Auth (better-auth) | POST | `/auth/sign-in/email-otp` | public |
+| Auth (better-auth) | GET | `/auth/get-session` | user |
+| Auth (better-auth) | POST | `/auth/sign-out` | user |
 | Me | GET | `/me` | user |
 | Studio | GET | `/studio` | user |
 | Studio | PATCH | `/studio` | user |
@@ -52,20 +52,20 @@ OpenAPI is generated from the NestJS decorators and served at `/v1/docs` outside
 | Exports | GET | `/projects/:project_id/exports` | user |
 | Exports | POST | `/projects/:project_id/exports` | user, idempotent |
 | Exports | GET | `/projects/:project_id/download` | user |
-| Events | POST | `/events/ticket` | user |
-| Events | GET | `/events` | SSE ticket |
+| Events | GET | `/events` | user (session cookie) |
 | Ops | GET | `/health`, `/health/ready` | public |
 | Ops | — | `/admin/queues` (Bull Board) | basic auth, not public |
-
-Diagram mapping: `/send-otp` → `POST /auth/otp/request`; `/signin` → `POST /auth/otp/verify` (creates studio + user on first sign-in); `/google` → not in MVP.
 
 ## 1. Conventions
 
 ### 1.1 Authentication
-- **Access token**: JWT, 15 min, `Authorization: Bearer <token>`. Claims: `sub` (user_id), `studio_id`, `exp`, `jti`.
-- **Refresh token**: opaque 32-byte random, stored hashed in `sessions`, delivered as an `HttpOnly; Secure; SameSite=Strict; Path=/v1/auth` cookie named `dubbio_rt`, 30 days, rotated on every refresh (reuse of a rotated token revokes all sessions of the user).
-- **SSE**: `EventSource` cannot send headers, so `GET /events` takes a one-time ticket (§9).
-- "user" auth means a valid access token. There are no roles in MVP; every studio-owned resource is scoped by `studio_id` from the token. A resource that belongs to another studio returns **404**, never 403 (no id enumeration).
+- **Provider**: better-auth (Prisma adapter, Email OTP plugin), mounted at `/v1/auth` (`basePath`). Dubbio defines no authentication endpoints of its own (§3).
+- **Session**: cookie session stored in Postgres (`sessions`). The cookie is `HttpOnly`, `Secure` in production, `SameSite=Lax`, with cookie prefix `dubbio`. Lifetime 30 days, extended at most once a day while the user is active. The web app and the API share a registrable domain and the browser sends `credentials: "include"`.
+- **Identity per request**: a global guard (`@thallesp/nestjs-better-auth`) resolves the session on every route except those marked anonymous (`/auth/*`, `/health*`). Handlers receive `AuthContext { user_id, studio_id, email, name }`, where `studio_id` is `users.studio_id` of the session user.
+- **CSRF**: CORS allows only the origins in `trustedOrigins`, with credentials. In addition, any `POST`, `PUT`, `PATCH` or `DELETE` authenticated by cookie whose `Origin` header is missing or not in `trustedOrigins` is rejected with `403 forbidden_origin`.
+- **SSE**: `GET /events` authenticates with the same cookie (§11).
+- "user" in the Auth column of this document means a valid session. There are no roles in MVP; every studio-owned resource is scoped by `studio_id` from the session user. A resource that belongs to another studio returns **404**, never 403 (no id enumeration).
+- **Accounts**: the first successful OTP sign-in creates the user (sign-up enabled) and, in the same call, the user's studio through a better-auth database hook (§3). One user per studio.
 
 ### 1.2 Responses and errors
 - JSON, snake_case, timestamps ISO-8601 UTC, ids UUID.
@@ -78,7 +78,8 @@ Diagram mapping: `/send-otp` → `POST /auth/otp/request`; `/signin` → `POST /
 | HTTP | code | when |
 |---|---|---|
 | 400 | `validation_error` | body/query fails validation; `details.fields[]` |
-| 401 | `unauthenticated` | missing/expired token, bad OTP, bad refresh |
+| 401 | `unauthenticated` | missing, expired or revoked session |
+| 403 | `forbidden_origin` | cookie-authenticated write from an origin outside `trustedOrigins` |
 | 403 | `quota_exceeded` | monthly minutes or voice slots; `details.quota` |
 | 403 | `regeneration_limit_reached` | `projects.regeneration_limit` hit |
 | 404 | `not_found` | also for other studios' resources |
@@ -90,6 +91,8 @@ Diagram mapping: `/send-otp` → `POST /auth/otp/request`; `/signin` → `POST /
 | 429 | `rate_limited` | `Retry-After` header set |
 | 500 | `internal` | unexpected; Sentry id in `details.ref` |
 
+Responses of `/auth/*` use better-auth's own error format (`code`, `message`); the table above applies to every other route.
+
 ### 1.3 Pagination
 Cursor-based on `(created_at desc, id desc)`: `?limit=20&cursor=<opaque>`; `limit` 1–100, default 20. Segments are not paginated (a 3-minute video has well under 500).
 
@@ -100,13 +103,9 @@ Endpoints marked *idempotent* accept `Idempotency-Key: <uuid>` (required for `PO
 
 | Scope | Limit |
 |---|---|
-| `POST /auth/otp/request` | 3 / 10 min per email, 10 / h per IP |
-| `POST /auth/otp/verify` | 5 attempts per code (DB), 20 / h per IP |
-| `POST /auth/refresh` | 30 / h per session |
 | All authenticated routes | 300 / min per user |
 | `POST /projects/:id/upload/parts` | 60 / min per project |
 | `POST /review/.../edit`, `/revert`, `/review/characters/.../voice` | 30 / min per user, plus the project regeneration limit |
-| `POST /events/ticket` | 20 / min per user |
 
 ### 1.6 Limits (config, defaults)
 Video: `video/mp4` only, ≤ 500 MB, ≤ 180 s (duration is checked by the worker in `validate`). Voice sample: `audio/wav`, `audio/mpeg`, `audio/mp4`, ≤ 25 MB (confirm against the ElevenLabs IVC sample limits in the spike). `translated_text` ≤ 500 characters.
@@ -115,7 +114,7 @@ Video: `video/mp4` only, ≤ 500 MB, ≤ 180 s (duration is checked by the worke
 
 ```jsonc
 // User
-{ "id": "uuid", "email": "a@b.c", "name": null, "studio_id": "uuid", "created_at": "…" }
+{ "id": "uuid", "email": "a@b.c", "email_verified": true, "name": "a", "studio_id": "uuid", "created_at": "…" }
 
 // Studio
 { "id": "uuid", "name": "Studio A",
@@ -181,22 +180,32 @@ Video: `video/mp4` only, ≤ 500 MB, ≤ 180 s (duration is checked by the worke
 }
 ```
 
-## 3. Auth
+## 3. Auth (better-auth, mounted at `/v1/auth`)
 
-#### `POST /auth/otp/request` — public
-Request `{ "email": "a@b.c" }`. Response **202** `{}` always (no account enumeration). Side effects: supersede open codes, insert `otp_codes`, send email.
-Errors: 400, 429.
+These endpoints are implemented by better-auth, not by Dubbio code. Bodies, status codes and error `code` values under `/auth/*` are better-auth's (camelCase JSON, e.g. `emailVerified`); the snake_case shapes of §2 and the error format of §1.2 apply to every other route, including `GET /me`.
 
-#### `POST /auth/otp/verify` — public
-Request `{ "email": "a@b.c", "code": "123456" }`.
-Response **200** `{ "access_token": "…", "expires_in": 900, "user": User, "studio": Studio, "is_new_user": false }` + `Set-Cookie: dubbio_rt=…`.
-First sign-in creates `studios` + `users` in one transaction. Errors: 400; 401 `unauthenticated` (wrong, expired, consumed, or 5 attempts used — same message for all); 429.
+Email OTP settings: `otpLength` 6, `expiresIn` 300 s, `allowedAttempts` 5, `storeOTP` `"hashed"`, `disableSignUp` false, `resendStrategy` `"rotate"` (every request issues a new code). `sendVerificationOTP` hands the code to `infra/email` without awaiting the send, so response time does not reveal whether an email is known.
 
-#### `POST /auth/refresh` — cookie
-Response **200** `{ "access_token": "…", "expires_in": 900 }` + rotated cookie. Errors: 401 (missing, expired, revoked, reused → all user sessions revoked).
+#### `POST /auth/email-otp/send-verification-otp` — public
+Request `{ "email": "a@b.c", "type": "sign-in" }`. Stores the code hashed in `verifications` and emails it.
 
-#### `POST /auth/logout` — user
-Revokes the current session; clears the cookie. **204**.
+#### `POST /auth/sign-in/email-otp` — public
+Request `{ "email": "a@b.c", "otp": "123456" }`. On success: session cookie in `Set-Cookie` and the user in the body. An email seen for the first time is signed up in the same call. After 5 wrong attempts the code is void (`TOO_MANY_ATTEMPTS`) and a new one must be requested.
+
+#### `GET /auth/get-session` — user
+Returns the current session and user, or `null` when signed out.
+
+#### `POST /auth/sign-out` — user
+Deletes the session row and clears the cookie.
+
+#### Studio creation on first sign-in
+`databaseHooks.user.create.before` creates the `studios` row (default quotas) and sets `users.studio_id` (see `02-database.md` §4.2). Nothing else happens in the hook.
+
+#### Confirm in Sprint 0
+1. The final public path is exactly `/v1/auth/...`: `basePath` is `/v1/auth` and the Nest module must not add a second prefix.
+2. The CLI-generated Prisma models use `uuid` columns with a database default (with `generateId: "uuid"`, PostgreSQL generates the ids).
+3. The payload returned by `user.create.before` is persisted, including the additional field `studio_id`.
+4. The session resolves on the SSE route with `withCredentials`.
 
 ## 4. Me and Studio
 
@@ -360,9 +369,8 @@ Serves `current_export_id`. Never blocked by review state; `is_stale: true` tell
 
 ## 11. Events (SSE)
 
-#### `POST /events/ticket` → **200** `{ "ticket": "…", "expires_in": 60 }` (one-time, Redis).
-#### `GET /events?ticket=…` → `text/event-stream`
-Streams every event of the caller's studio. Heartbeat comment `: ping` every 20 s (keeps the Cloudflare proxy connection alive). Events are notifications, not state: on reconnect the client refetches the resources it shows (`Last-Event-ID` is not honoured in MVP).
+#### `GET /events` → `text/event-stream`
+Authenticated by the session cookie (`new EventSource(url, { withCredentials: true })`); `401` without a valid session. The session is checked when the stream opens; the client closes the stream on sign-out. Streams every event of the caller's studio. Heartbeat comment `: ping` every 20 s (keeps the Cloudflare proxy connection alive). Events are notifications, not state: on reconnect the client refetches the resources it shows (`Last-Event-ID` is not honoured in MVP).
 
 ```
 event: project.updated

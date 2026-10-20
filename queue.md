@@ -13,7 +13,6 @@ Stack: Redis 7 + BullMQ. One worker process in MVP (single VPS). Names below mat
 | `render` | `project.export` | end of `segment.regenerate` batch, `revert`, `POST /exports`, pipeline `export` step | 2 (1 per project by rule) | 3 | exp 15 s | `export:{export_id}` |
 | `maintenance` | `project.purge` | `DELETE /projects/:id` | 1 | 5 | exp 60 s | `purge:{project_id}` |
 | `maintenance` | `cleanup.uploads` | repeatable, hourly | 1 | 1 | — | `cleanup.uploads` |
-| `maintenance` | `cleanup.otp_sessions` | repeatable, daily 03:00 | 1 | 1 | — | `cleanup.otp_sessions` |
 | `maintenance` | `cleanup.retention` | repeatable, daily 03:30 | 1 | 1 | — | `cleanup.retention` |
 | `maintenance` | `usage.spend_check` | repeatable, hourly | 1 | 1 | — | `usage.spend_check` |
 | `maintenance` | `jobs.stuck_sweep` | repeatable, every 15 min | 1 | 1 | — | `jobs.stuck_sweep` |
@@ -113,7 +112,6 @@ Steps: abort any open multipart upload → list R2 prefix `studios/{studio_id}/p
 | Job | Work |
 |---|---|
 | `cleanup.uploads` | `uploads` with `status = pending` and `expires_at < now()`: abort multipart on R2, `status := expired`; if the project is still `uploading`, soft-delete it and enqueue `project.purge`. |
-| `cleanup.otp_sessions` | delete `otp_codes` older than 24 h and `sessions` expired or revoked for > 7 days. |
 | `cleanup.retention` | per `02-database.md` §7: intermediate assets 30 days after `completed_at`; non-current version audio after 30 days (row kept, `audio_key := null`); non-current exports after 7 days. |
 | `usage.spend_check` | sum `usage_events.cost_usd` for the calendar month; at ≥ 80 % of the configured cap send an ops alert once per day; at ≥ 100 % set Redis key `spend_cap_reached` (TTL to month end). The API checks that key on `upload/complete`, `voices/confirm`, `POST /voices` and every review write and answers `403 quota_exceeded` with `details.quota = "global_spend"`. |
 | `jobs.stuck_sweep` | `step_runs.status = running` with `started_at` older than 2× the step timeout and no active BullMQ job for the project → mark step and project `failed` (`error: stalled`); same for `segment_versions.generating` older than 10 min and `exports.rendering` older than 15 min. This is the dead-letter mechanism: failures land in the tables the UI already shows, with a `retry` endpoint for each. |
@@ -137,9 +135,9 @@ sequenceDiagram
   A->>Q: pipeline.run {from_step: validate}
   A-->>W: 200 (SSE: project.updated queued)
   Q->>K: pipeline.run
-  K->>P: analyzing, then validate → separate (Demucs) → transcribe
+  K->>P: analyzing; validate → separate (Demucs) → transcribe
   K->>E: STT with diarization
-  K->>P: characters + segments, then analyze (LLM) → context, emotion
+  K->>P: characters + segments; analyze (LLM) → context, emotion
   K->>P: needs_voices (SSE)
   W->>A: PUT /characters/:id/voice ×N, POST /voices/confirm
   A->>Q: pipeline.run {from_step: translate}
@@ -174,11 +172,11 @@ sequenceDiagram
   A->>Q: segment.regenerate {version_id}
   A-->>W: 202 (segment.pending_version = v2)
   Q->>K: segment.regenerate
-  K->>P: v2 generating → ready, current_version_id=v2, review_status=pending, content_version+1
+  K->>P: v2 generating → ready; current_version_id=v2; review_status=pending; content_version+1
   K->>P: export rule → exports v2 pending
   K->>Q: project.export {export_id}
   Q->>K: project.export
-  K->>P: exports v2 ready, current_export_id (SSE export.updated)
+  K->>P: exports v2 ready; current_export_id (SSE export.updated)
   W->>A: PATCH /review/segments/:sid {review_status: approved}
   Note over W,A: Undo = POST /revert {version_id: v1} → content_version+1 → export rule only (no TTS, not counted)
 ```

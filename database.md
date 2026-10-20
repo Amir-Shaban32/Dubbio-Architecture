@@ -1,19 +1,6 @@
 # Dubbio — 02 Database schema
 
-Baseline: `dubbio-system.md` §6. This document replaces §6 and §4 (status lifecycle).
 Stack: PostgreSQL 16, Prisma. Names below are the physical names (snake_case); Prisma models map to them with `@map`/`@@map`. JSON in the API and job payloads uses the same names.
-
-## 0. Changes versus the baseline
-
-| Change | Why |
-|---|---|
-| Pause moved before translation: `analyzing → needs_voices → rendering` | Character gender comes from the assigned voice; translation needs it (decision Q2). |
-| `generate_speech` + `fit_timing` merged into `synthesize` | Fit runs on the same audio buffer right after TTS; one failure domain, one per-segment retry. |
-| `segment_versions` table; segments hold no translated text themselves | Review needs edit history and undo. A version is one `(translated_text, voice_id, emotion)` tuple plus its generated audio. |
-| `exports` table + `projects.content_version` | Re-exports and "is the download stale?" without a new project status (decision Q3). |
-| `uploads` and `assets` tables instead of `project.video_key` | Resumable multipart needs state; purge/retention needs an inventory of files. |
-| `otp_codes`, `sessions`, `usage_events` added | Mentioned in the baseline prose, missing from the ERD. |
-| `studios` carries quotas | Per-studio limits without a billing module. |
 
 ## 1. ERD
 
@@ -25,6 +12,7 @@ erDiagram
   studios ||--o{ uploads : owns
   studios ||--o{ usage_events : accrues
   users ||--o{ sessions : has
+  users ||--o{ accounts : has
   users ||--o{ projects : created
   uploads |o--o| projects : "source video"
   uploads |o--o| voices : "sample"
@@ -39,9 +27,10 @@ erDiagram
   voices ||--o{ segment_versions : "spoken by"
 
   studios { uuid id PK  text name  int monthly_minutes_quota  int voice_slots_quota  int regeneration_limit }
-  users { uuid id PK  uuid studio_id FK  citext email  text auth_provider }
-  otp_codes { uuid id PK  citext email  text code_hash  int attempts  timestamptz expires_at }
-  sessions { uuid id PK  uuid user_id FK  text refresh_token_hash  timestamptz expires_at  timestamptz revoked_at }
+  users { uuid id PK  uuid studio_id FK  text email  text name  boolean email_verified }
+  sessions { uuid id PK  uuid user_id FK  text token  timestamptz expires_at  text ip_address  text user_agent }
+  accounts { uuid id PK  uuid user_id FK  text provider_id  text account_id }
+  verifications { uuid id PK  text identifier  text value  timestamptz expires_at }
   voices { uuid id PK  uuid studio_id FK  text name  enum gender  enum status  text provider_voice_id  timestamptz consent_confirmed_at }
   uploads { uuid id PK  uuid studio_id FK  enum kind  uuid project_id FK  uuid voice_id FK  text r2_key  text multipart_upload_id  enum status }
   projects { uuid id PK  uuid studio_id FK  uuid created_by FK  enum status  enum failed_step  text target_lang  text target_dialect  int content_version  int regeneration_count  uuid current_export_id FK }
@@ -82,7 +71,8 @@ Adding a value is an `ALTER TYPE … ADD VALUE` migration; Prisma generates it. 
 
 - Primary keys: `uuid` default `gen_random_uuid()`. Cursor pagination orders by `(created_at, id)`.
 - Every mutable table has `created_at timestamptz not null default now()` and `updated_at timestamptz not null default now()` (updated by Prisma `@updatedAt`). Listed once here, not repeated below.
-- Tenant column: every studio-owned row carries `studio_id`. Child rows of a project (`assets`, `characters`, `segments`, `segment_versions`, `step_runs`, `exports`) reach the tenant through `projects.studio_id`; the API always loads the project first (scoped by `studio_id` from the JWT) and reads children by `project_id`.
+- Authentication tables (`users`, `sessions`, `accounts`, `verifications`) are owned by better-auth (Prisma adapter, Email OTP plugin). Ids come from `advanced.database.generateId: "uuid"`, so they are `uuid` like every other key and the foreign keys below stay `uuid`. Application code never writes these tables directly: it goes through better-auth and its `user.create.before` database hook (§4.2). The Prisma models keep the adapter's names (`user`, `session`, `account`, `verification`) and map to the plural table names with `@@map`; columns are snake_case via `@map`. The Prisma definition of these four models is generated with the better-auth CLI, reviewed, and then migrated with Prisma Migrate like every other model.
+- Tenant column: every studio-owned row carries `studio_id`. Child rows of a project (`assets`, `characters`, `segments`, `segment_versions`, `step_runs`, `exports`) reach the tenant through `projects.studio_id`; the API always loads the project first (scoped by `studio_id` of the session user) and reads children by `project_id`.
 - Soft delete (`deleted_at`) only on `projects` and `voices`. Everything else hard-deletes by cascade.
 - Files live in R2; the database stores keys only (§7).
 
@@ -103,46 +93,63 @@ Delete: not supported in MVP.
 
 ### 4.2 `users`
 
-| column | type | constraints | notes |
-|---|---|---|---|
-| id | uuid | PK | |
-| studio_id | uuid | FK → studios, not null, `ON DELETE RESTRICT` | |
-| email | citext | not null, unique | `citext` extension; case-insensitive uniqueness |
-| name | text | null | |
-| auth_provider | text | not null default `'otp'` | room for `'google'` later |
-| last_login_at | timestamptz | null | |
-
-Indexes: `(studio_id)`. One user per studio in MVP is an application rule, not a constraint, so teams need no migration later.
-
-### 4.3 `otp_codes`
+better-auth `user` model plus one additional field.
 
 | column | type | constraints | notes |
 |---|---|---|---|
-| id | uuid | PK | |
-| email | citext | not null | not an FK: the user may not exist yet |
-| code_hash | text | not null | SHA-256 of the 6-digit code + server pepper |
-| attempts | int | not null default 0 | verify attempts; max 5 |
-| expires_at | timestamptz | not null | `created_at + 5 min` |
-| consumed_at | timestamptz | null | set on success or when superseded by a newer code |
-| request_ip | inet | null | audit |
+| id | uuid | PK | generated by better-auth (`generateId: "uuid"`) |
+| studio_id | uuid | FK → studios, not null, `ON DELETE RESTRICT` | better-auth additional field (`type: string`, `input: false`); supplied by the `user.create.before` hook, so it is not `required` at the better-auth layer while the column is `NOT NULL` |
+| email | text | not null, unique | stored lowercase by better-auth |
+| email_verified | boolean | not null default false | set by better-auth after a successful OTP sign-in |
+| name | text | not null | the hook defaults it to the local part of the email |
+| image | text | null | unused |
 
-Indexes: `(email, created_at desc)`. Rule: requesting a new code sets `consumed_at` on all open codes for that email. Rows older than 24 h are purged by a cleanup job. Redis holds only the rate-limit counters; the code itself is here so an audit and a Redis flush do not lose state.
+Indexes: unique `(email)`, `(studio_id)`.
+Studio creation: `databaseHooks.user.create.before` calls `studios.domain.StudioProvisioner`, which inserts a `studios` row (name `"{name}'s studio"`, default quotas) and returns the user payload with `studio_id` and `name`. The studio exists before the user insert, so `studio_id` stays `NOT NULL`; if the user insert then fails, an empty studio is left behind, which is harmless. One user per studio is an application rule, not a constraint, so teams need no migration later.
+Delete: users are never deleted in MVP (better-auth account deletion stays disabled).
 
-### 4.4 `sessions` (refresh tokens)
+### 4.3 `sessions`
+
+better-auth `session` model. Cookie sessions are stored in Postgres.
 
 | column | type | constraints | notes |
 |---|---|---|---|
 | id | uuid | PK | |
 | user_id | uuid | FK → users, not null, `ON DELETE CASCADE` | |
-| refresh_token_hash | text | not null, unique | SHA-256 of the opaque token |
-| replaced_by_session_id | uuid | FK → sessions, null, `ON DELETE SET NULL` | rotation chain |
+| token | text | not null, unique | session token carried by the cookie |
+| expires_at | timestamptz | not null | `now() + 30 days` at creation; pushed forward by better-auth at most once per day (`updateAge`) |
+| ip_address | text | null | |
 | user_agent | text | null | |
-| ip | inet | null | |
-| expires_at | timestamptz | not null | 30 days |
-| last_used_at | timestamptz | null | |
-| revoked_at | timestamptz | null | |
 
-Indexes: `(user_id)`, `(expires_at)` for cleanup. Rotation: every refresh creates a new row and sets `replaced_by_session_id` on the old one. If a token with `revoked_at` or `replaced_by_session_id` set is presented again, revoke every session of that user (reuse detection).
+Indexes: unique `(token)`, `(user_id)`. Dubbio runs no cleanup job for this table.
+
+### 4.4 `accounts` and `verifications`
+
+`accounts` (better-auth `account`). Required by the adapter; with Email OTP as the only sign-in method (no password, no OAuth) it holds nothing in MVP.
+
+| column | type | constraints | notes |
+|---|---|---|---|
+| id | uuid | PK | |
+| user_id | uuid | FK → users, not null, `ON DELETE CASCADE` | |
+| account_id | text | not null | provider-assigned id |
+| provider_id | text | not null | |
+| access_token, refresh_token, id_token | text | null | |
+| access_token_expires_at, refresh_token_expires_at | timestamptz | null | |
+| scope | text | null | |
+| password | text | null | |
+
+Indexes: `(user_id)`.
+
+`verifications` (better-auth `verification`). Holds pending email OTPs; read and written only by better-auth.
+
+| column | type | constraints | notes |
+|---|---|---|---|
+| id | uuid | PK | |
+| identifier | text | not null | set by the Email OTP plugin |
+| value | text | not null | the OTP, hashed (`storeOTP: "hashed"`); attempt tracking is internal to the plugin |
+| expires_at | timestamptz | not null | `now() + 300 s` |
+
+Indexes: `(identifier)`. No foreign keys.
 
 ### 4.5 `voices`
 
@@ -421,10 +428,11 @@ Derived segment `state` (computed in the API, not stored):
 
 - **Versions instead of in-place edits.** The reviewer needs undo and a diff between what the pipeline produced and what was changed. Making a version the unit of generation also gives the regeneration job a natural idempotency key and makes "undo" free (audio of old versions is kept).
 - **No stored segment status.** Everything a status column would say is already in the versions. Deriving it costs one small join per listing and removes a class of drift bugs.
-- **`exports` table instead of a project status.** Explained in §5.5 and the header; also gives an audit trail of what was rendered when, which a thesis evaluation will want.
+- **`exports` table instead of a project status.** A re-render does not change where the project is in its lifecycle (§5.5); the table also gives an audit trail of what was rendered when, which a thesis evaluation will want.
 - **JSONB where the shape is still research**: `projects.context`, `segments.analysis`, `characters.analysis`, `step_runs.output`, `source_meta`, `render_settings`. Columns are promoted only when a query needs them (`emotion`, `addressee_character_id`, `duration_ms` are already promoted). Nothing the API filters or sorts by lives in JSONB.
 - **Soft delete only where files or history hang off the row** (projects, voices). Purging R2 can fail halfway; soft delete makes the purge retryable and keeps the row until the files are gone.
 - **Multi-tenancy by `studio_id` column + application scoping**, no Postgres RLS in MVP: one database role, Prisma, four developers; RLS adds a second place where the rule can be wrong. Every repository method takes `studio_id` as the first argument; a test asserts that every tenant table has it.
+- **Authentication delegated to better-auth.** Sessions, one-time codes and their hashing are not ours to maintain. The only coupling is `users.studio_id`, so the tenant travels with the session and every request knows its `studio_id` without an extra lookup.
 - **Usage as an append-only event log**, not counters: counters cannot be audited or re-priced; the monthly sum is tiny at MVP scale.
 - **UUID v4 everywhere.** Time-ordered ids would help index locality later; not worth a dependency now.
 
@@ -444,4 +452,4 @@ studios/{studio_id}/projects/{project_id}/exports/v{version_no}.mp4
 
 The project prefix makes purge a single list-and-delete. Retention (cleanup job, daily): `voice_track`, `background_track`, `dubbed_track` assets older than 30 days after `completed_at` are deleted (a later edit must re-run `separate`; acceptable and rare); audio of non-current segment versions older than 30 days is deleted and the row keeps its metadata; exports other than the current one are deleted after 7 days.
 
-Presigned URLs: upload parts 1 h, downloads 15 min (as in the baseline NFRs).
+Presigned URLs: upload parts 1 h, downloads 15 min.
