@@ -137,9 +137,9 @@ sequenceDiagram
   A->>Q: pipeline.run {from_step: validate}
   A-->>W: 200 (SSE: project.updated queued)
   Q->>K: pipeline.run
-  K->>P: analyzing; validate → separate (Demucs) → transcribe
+  K->>P: analyzing, then validate → separate (Demucs) → transcribe
   K->>E: STT with diarization
-  K->>P: characters + segments; analyze (LLM) → context, emotion
+  K->>P: characters + segments, then analyze (LLM) → context, emotion
   K->>P: needs_voices (SSE)
   W->>A: PUT /characters/:id/voice ×N, POST /voices/confirm
   A->>Q: pipeline.run {from_step: translate}
@@ -174,11 +174,11 @@ sequenceDiagram
   A->>Q: segment.regenerate {version_id}
   A-->>W: 202 (segment.pending_version = v2)
   Q->>K: segment.regenerate
-  K->>P: v2 generating → ready; current_version_id=v2; review_status=pending; content_version+1
+  K->>P: v2 generating → ready, current_version_id=v2, review_status=pending, content_version+1
   K->>P: export rule → exports v2 pending
   K->>Q: project.export {export_id}
   Q->>K: project.export
-  K->>P: exports v2 ready; current_export_id (SSE export.updated)
+  K->>P: exports v2 ready, current_export_id (SSE export.updated)
   W->>A: PATCH /review/segments/:sid {review_status: approved}
   Note over W,A: Undo = POST /revert {version_id: v1} → content_version+1 → export rule only (no TTS, not counted)
 ```
